@@ -5,6 +5,7 @@ covered here is when chunking runs at all, what it does with a chunk that fails,
 the published review says about having been assembled from several calls.
 """
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,7 +17,10 @@ from pr_agent.config_loader import get_settings
 from pr_agent.tools.pr_reviewer import PRReviewer
 from tests.unittest._settings_helpers import restore_settings, snapshot_settings
 
-_TRACKED_KEYS = ("pr_reviewer.enable_large_pr_chunking", "pr_reviewer.max_number_of_calls")
+_TRACKED_KEYS = (
+    "pr_reviewer.enable_large_pr_chunking", "pr_reviewer.max_number_of_calls",
+    "pr_reviewer.parallel_calls", "pr_reviewer.inter_call_delay_seconds",
+)
 
 CHUNK_A = """review:
   score: 90
@@ -55,11 +59,13 @@ def _make_reviewer():
     return reviewer
 
 
-@pytest.fixture
-def chunking_enabled():
+@pytest.fixture(params=[True, False], ids=["parallel", "sequential"])
+def chunking_enabled(request):
     snapshot = snapshot_settings(_TRACKED_KEYS)
     get_settings().set("pr_reviewer.enable_large_pr_chunking", True)
     get_settings().set("pr_reviewer.max_number_of_calls", 3)
+    get_settings().set("pr_reviewer.parallel_calls", request.param)
+    get_settings().set("pr_reviewer.inter_call_delay_seconds", 0)
     with patch("pr_agent.algo.token_budget.get_max_tokens", return_value=10000):
         yield
     restore_settings(snapshot)
@@ -657,3 +663,162 @@ def test_the_chunk_note_comes_before_the_review_coverage_footer():
 
     assert review.index("Chunked review:") < review.index("⚠️ **Review coverage:**")
     assert "- `left_out.py`" in review
+
+
+@pytest.mark.asyncio
+async def test_chunk_dispatch_is_concurrent_only_when_enabled(chunking_enabled):
+    reviewer = _make_reviewer()
+    active = 0
+    peak = 0
+    events = []
+    real_sleep = asyncio.sleep
+
+    async def predict(_model, chunk):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        events.append(("start", chunk))
+        await real_sleep(0)
+        events.append(("end", chunk))
+        active -= 1
+        return CHUNK_A if chunk == "chunk-a" else CHUNK_B
+
+    reviewer._get_prediction = AsyncMock(side_effect=predict)
+    with patch("pr_agent.tools.pr_reviewer.get_pr_multi_diffs", return_value=(["chunk-a", "chunk-b"], [])):
+        await reviewer._prepare_chunked_prediction("model")
+
+    if get_settings().pr_reviewer.parallel_calls:
+        assert peak == 2
+        assert events[:2] == [("start", "chunk-a"), ("start", "chunk-b")]
+    else:
+        assert peak == 1
+        assert events == [("start", "chunk-a"), ("end", "chunk-a"),
+                          ("start", "chunk-b"), ("end", "chunk-b")]
+    assert reviewer.prediction_data["review"]["score"] == 40
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delay", [0, 35, 0.5])
+async def test_sequential_delay_only_between_executed_calls(chunking_enabled, delay):
+    get_settings().set("pr_reviewer.parallel_calls", False)
+    get_settings().set("pr_reviewer.inter_call_delay_seconds", delay)
+    reviewer = _make_reviewer()
+    events = []
+
+    async def predict(_model, chunk):
+        events.append(("call", chunk))
+        return CHUNK_A
+
+    async def sleep(seconds):
+        events.append(("sleep", seconds))
+
+    reviewer._get_prediction = AsyncMock(side_effect=predict)
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_pr_multi_diffs",
+              return_value=(["a", "b", "c"], [])),
+        patch("pr_agent.tools.pr_reviewer.asyncio.sleep", new=AsyncMock(side_effect=sleep)),
+    ):
+        await reviewer._prepare_chunked_prediction("model")
+    expected = [("call", "a"), ("call", "b"), ("call", "c")]
+    if delay:
+        expected = [("call", "a"), ("sleep", delay), ("call", "b"), ("sleep", delay), ("call", "c")]
+    assert events == expected
+
+
+@pytest.mark.asyncio
+async def test_parallel_mode_ignores_valid_delay(chunking_enabled):
+    get_settings().set("pr_reviewer.parallel_calls", True)
+    get_settings().set("pr_reviewer.inter_call_delay_seconds", 35)
+    reviewer = _make_reviewer()
+    reviewer._get_prediction = AsyncMock(return_value=CHUNK_A)
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_pr_multi_diffs", return_value=(["a", "b"], [])),
+        patch("pr_agent.tools.pr_reviewer.asyncio.sleep", new_callable=AsyncMock) as sleep,
+    ):
+        await reviewer._prepare_chunked_prediction("model")
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_paced_fallback_only_calls_pending_chunks(chunking_enabled):
+    get_settings().set("pr_reviewer.parallel_calls", False)
+    get_settings().set("pr_reviewer.inter_call_delay_seconds", 35)
+    reviewer = _make_reviewer()
+    reviewer._get_prediction = AsyncMock(side_effect=[CHUNK_A, RuntimeError("failed"), CHUNK_B])
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_pr_multi_diffs", return_value=(["a", "b", "c"], [])),
+        patch("pr_agent.tools.pr_reviewer.asyncio.sleep", new_callable=AsyncMock) as sleep,
+    ):
+        with pytest.raises(RuntimeError, match="failed"):
+            await reviewer._prepare_chunked_prediction("primary")
+        assert set(reviewer._chunked_results) == {0, 2}
+        assert sleep.await_count == 2
+        sleep.reset_mock()
+        reviewer._get_prediction.side_effect = [CHUNK_B]
+        await reviewer._prepare_chunked_prediction("fallback")
+        sleep.assert_not_awaited()
+    assert [call.args for call in reviewer._get_prediction.await_args_list] == [
+        ("primary", "a"), ("primary", "b"), ("primary", "c"), ("fallback", "b"),
+    ]
+    assert reviewer.review_failed_chunk_count == 0
+    assert reviewer.prediction_data["review"]["score"] == 40
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [BaseException("chunk fatal"), asyncio.CancelledError("chunk cancelled")])
+async def test_chunk_base_exception_remains_a_result_until_existing_result_handling(chunking_enabled, error):
+    reviewer = _make_reviewer()
+    reviewer._get_prediction = AsyncMock(side_effect=[error, CHUNK_A])
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_pr_multi_diffs", return_value=(["a", "b"], [])),
+        pytest.raises(type(error)),
+    ):
+        await reviewer._prepare_chunked_prediction("model")
+    assert reviewer._get_prediction.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_sequential_caller_cancellation_does_not_start_later_chunks(chunking_enabled):
+    get_settings().set("pr_reviewer.parallel_calls", False)
+    reviewer = _make_reviewer()
+    started = asyncio.Event()
+    blocked = asyncio.Event()
+
+    async def predict(_model, _chunk):
+        started.set()
+        await blocked.wait()
+
+    reviewer._get_prediction = AsyncMock(side_effect=predict)
+    with patch("pr_agent.tools.pr_reviewer.get_pr_multi_diffs", return_value=(["a", "b"], [])):
+        task = asyncio.create_task(reviewer._prepare_chunked_prediction("model"))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert reviewer._get_prediction.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key,value", [
+    ("parallel_calls", "false"), ("parallel_calls", 0), ("parallel_calls", None),
+    ("inter_call_delay_seconds", -1), ("inter_call_delay_seconds", "35"),
+    ("inter_call_delay_seconds", True), ("inter_call_delay_seconds", None),
+    ("inter_call_delay_seconds", float("nan")), ("inter_call_delay_seconds", float("inf")),
+])
+async def test_invalid_scheduling_config_fails_before_dispatch(chunking_enabled, key, value):
+    get_settings().set(f"pr_reviewer.{key}", value)
+    reviewer = _make_reviewer()
+    reviewer._get_prediction = AsyncMock(return_value=CHUNK_A)
+    with pytest.raises(ValueError, match=f"pr_reviewer.{key}"):
+        await reviewer._prepare_chunked_prediction("model")
+    reviewer._get_prediction.assert_not_awaited()
+
+
+def test_dispatch_defaults_preserve_upstream_behavior():
+    import tomllib
+    from pathlib import Path
+
+    defaults = tomllib.loads((Path(__file__).resolve().parents[2] /
+                             "pr_agent/settings/configuration.toml").read_text(encoding="utf-8"))
+    assert defaults["pr_reviewer"]["parallel_calls"] is True
+    assert defaults["pr_reviewer"]["inter_call_delay_seconds"] == 0

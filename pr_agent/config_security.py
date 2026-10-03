@@ -100,6 +100,7 @@ CLI_HOST_ONLY_KEYS_BY_SECTION = {
 PER_DIRECTORY_HOST_ONLY_KEYS_BY_SECTION = {
     "pr_reviewer": frozenset({
         "enable_large_pr_chunking", "max_number_of_calls",
+        "parallel_calls", "inter_call_delay_seconds",
         "inline_key_issues", "enable_review_labels_security",
         "enable_review_labels_effort", "require_estimate_effort_to_review",
         "require_security_review", "require_ticket_analysis_review",
