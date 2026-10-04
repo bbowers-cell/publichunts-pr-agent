@@ -1,6 +1,8 @@
+import copy
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from starlette_context import request_cycle_context
 
 import pr_agent.agent.pr_agent as pr_agent_module
 from pr_agent.algo.cli_args import _MAPPING_TOO_COMPLEX_ARG, CliArgs
@@ -371,3 +373,92 @@ def test_validate_user_args_rejects_mapping_value_beyond_visit_limit():
     ok, offending = CliArgs.validate_user_args([f"--qdrant={wide}"])
     assert ok is False
     assert offending == _MAPPING_TOO_COMPLEX_ARG
+
+
+# Include both effective bypasses and ambiguous spellings that currently create noncanonical keys.
+_SCHEDULING_OVERRIDE_ARGS = [
+    f"--{section}{before}{separator}{after}{key}={value}"
+    for section in ("pr_reviewer", "PR_REVIEWER")
+    for separator in (".", "__")
+    for before, after in (("", ""), (" ", ""), ("\t", ""), ("", " "), ("", "\t"), (" ", " "), ("\t", "\t"))
+    for key, value in (("parallel_calls", "true"), ("inter_call_delay_seconds", "1000000000"))
+] + [
+    '--pr_reviewer={"parallel_calls": true}',
+    '--pr_reviewer ={"parallel_calls": true}',
+    '--pr_reviewer={" inter_call_delay_seconds": 1000000000}',
+    '--pr_reviewer={"parallel_calls ": true}',
+    '--pr_reviewer={"num_max_findings": 7, "parallel_calls": true}',
+    '--pr_reviewer={"num_max_findings": 7, "inter_call_delay_seconds": 1000000000}',
+    '--PR_REVIEWER={"PARALLEL_CALLS": true}',
+    '--pr_reviewer__parallel_calls={"value": true}',
+]
+
+
+@pytest.mark.parametrize("argument", _SCHEDULING_OVERRIDE_ARGS)
+def test_validate_user_args_rejects_scheduling_path_variants(argument):
+    allowed, offending = CliArgs.validate_user_args([argument])
+    assert allowed is False
+    assert offending
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_form", ["comment", "argv"])
+@pytest.mark.parametrize("argument", _SCHEDULING_OVERRIDE_ARGS)
+async def test_review_handler_rejects_scheduling_path_variants(monkeypatch, argument, request_form):
+    """Reject before the real settings updater or any reviewer/model execution can begin."""
+    update_settings = Mock(wraps=pr_agent_module.update_settings_from_args)
+    tool = Mock()
+    tool.run = AsyncMock()
+    reviewer_factory = Mock(return_value=tool)
+    ai_factory = Mock()
+    notify = Mock()
+    # JSON mapping quotes must survive shlex's outer double-quoted comment token.
+    quoted_argument = argument.replace("\\", "\\\\").replace('"', '\\"')
+    request = f'/review "{quoted_argument}"' if request_form == "comment" else ["/review", argument]
+    monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda _url: None)
+    monkeypatch.setattr(pr_agent_module, "update_settings_from_args", update_settings)
+    monkeypatch.setitem(pr_agent_module.command2class, "review", reviewer_factory)
+
+    with request_cycle_context({"settings": copy.deepcopy(pr_agent_module.get_settings())}):
+        settings = pr_agent_module.get_settings()
+        settings.set("pr_reviewer.parallel_calls", False)
+        settings.set("pr_reviewer.inter_call_delay_seconds", 65)
+        handled = await pr_agent_module.PRAgent(ai_handler=ai_factory)._handle_request(
+            "https://example/pr/1", request, notify
+        )
+        assert handled is False
+        assert settings.pr_reviewer.parallel_calls is False
+        assert settings.pr_reviewer.inter_call_delay_seconds == 65
+    update_settings.assert_not_called()
+    reviewer_factory.assert_not_called()
+    tool.run.assert_not_awaited()
+    ai_factory.assert_not_called()
+    notify.assert_not_called()
+
+
+@pytest.mark.parametrize("argument", [
+    '--config .repo_context_files=[]',
+    '--github_action_config\t__fail_on_tool_errors=false',
+    '--pr_reviewer .publish_error_details=true',
+    '--skills .paths=[]',
+    '--push_outputs\t.enable=true',
+    '--openai .key=opaque',
+    '--github__ webhook_secret=opaque',
+    '--qdrant={"server ": {"url": "https://evil.example"}}',
+    '--qdrant={"server": {" url": "https://evil.example"}}',
+    # Fail closed even for an otherwise allowed key; do not reinterpret ambiguous syntax.
+    '--qdrant .timeout=5',
+])
+def test_validate_user_args_rejects_ambiguous_paths_across_security_rules(argument):
+    allowed, offending = CliArgs.validate_user_args([argument])
+    assert allowed is False
+    assert offending
+
+
+@pytest.mark.parametrize("argument", [
+    '--pr_reviewer.num_max_findings = 7',
+    '--qdrant={"timeout": 5, "prefer_grpc": true}',
+    '--qdrant={"instructions": "spaces and\t tabs in values stay allowed"}',
+])
+def test_setting_path_rejection_preserves_unambiguous_names_and_mapping_values(argument):
+    assert CliArgs.validate_user_args([argument]) == (True, "")

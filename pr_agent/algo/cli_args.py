@@ -15,8 +15,13 @@ _MAPPING_TOO_COMPLEX_ARG = '.mapping_value_too_complex'
 class CliArgs:
     @staticmethod
     def _host_only_setting_arg(arg: str) -> str | None:
-        """Return a protected setting token when a CLI arg targets a host-only key."""
+        """Return a blocked token for host-only keys or ambiguous CLI setting paths."""
         setting_name = arg.lstrip('-').split('=', 1)[0].strip().replace('__', '.')
+        # Dynaconf can strip section whitespace while replacing its contents. Reject
+        # ambiguous paths rather than interpreting them differently from application.
+        # Mapping paths use this check too; whitespace in values remains untouched.
+        if any(character.isspace() for character in setting_name):
+            return '.ambiguous_setting_path'
         section, separator, key = setting_name.partition('.')
         if not separator:
             if (section in REPO_OVERRIDABLE_KEYS_BY_HOST_SECTION
