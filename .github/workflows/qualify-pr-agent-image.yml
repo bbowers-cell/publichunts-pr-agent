@@ -1,0 +1,575 @@
+name: Qualify patched PR-Agent image
+
+on:
+  push:
+    branches:
+      - ci/qualify-pr-agent-image-22de14dc
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout qualification workflow history
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify source, build pinned overlay, and qualify offline
+        id: qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/qualification_runner.py" <<'QUALIFICATION_RUNNER'
+          """Runner-side identity/build/inspection gates; no registry publication operations."""
+          import hashlib
+          import json
+          import os
+          import platform
+          import re
+          import subprocess
+          from pathlib import Path
+
+          SOURCE = "22de14dc5563c3618cc995bd354e64cd79893bc3"
+          UPSTREAM = "8e5a9295973b24af4b70cafd0b660a230811ef9e"
+          REVIEWED = "147c0aadb61683cdeb69bd2d0fffa23ed2a5963f"
+          BASE = "pragent/pr-agent@sha256:31b9aac6ab067bada9a0c1b001d30ebc500ea4487e00a93c18c59b9ef5fa66db"
+          TAG = "publichunts-pr-agent:qualification-22de14dc"
+          RUNTIME = ["pr_agent/algo/cli_args.py", "pr_agent/tools/pr_reviewer.py",
+                     "pr_agent/config_security.py", "pr_agent/settings/configuration.toml"]
+          EXPECTED = sorted(RUNTIME + ["tests/unittest/test_cli_args_security.py",
+              "tests/unittest/test_review_large_diff_chunking.py", "tests/unittest/test_per_directory_settings.py",
+              "tests/unittest/test_config_reference.py", "docs/docs/usage-guide/configuration_reference.md"])
+          ROOT = Path(os.environ["RUNNER_TEMP"]) / "pr-agent-qualification"
+          ROOT.mkdir()
+          EVIDENCE = ROOT / "evidence"
+          EVIDENCE.mkdir()
+          SRC = ROOT / "source"
+          REPORT = {"source_commit": SOURCE, "base_reference": BASE, "local_tag": TAG,
+                    "runner_platform": platform.platform(), "runner_machine": platform.machine()}
+
+
+          def run(*command, cwd=None):
+              try:
+                  result = subprocess.run(command, cwd=cwd, check=True, text=True, capture_output=True, timeout=1200)
+              except subprocess.CalledProcessError as error:
+                  # Harness assertions name suspicious fields/files, never their contents.
+                  print("Qualification command failed:", command[0], "exit", error.returncode, flush=True)
+                  print((error.stdout or "")[-12000:], flush=True)
+                  print((error.stderr or "")[-12000:], flush=True)
+                  raise
+              return result.stdout.strip()
+
+
+          def digest(path):
+              with path.open("rb") as stream:
+                  return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+          REPORT["uname"] = run("uname", "-a")
+          REPORT["docker_version"] = json.loads(run("docker", "version", "--format", "{{json .}}"))
+          REPORT["buildx_version"] = run("docker", "buildx", "version")
+          REPORT["docker_architecture"] = run("docker", "info", "--format", "{{.Architecture}}")
+          assert REPORT["runner_machine"] == "x86_64"
+          assert REPORT["docker_architecture"] in ("x86_64", "amd64")
+          print(json.dumps(REPORT, indent=2))
+
+          print("GATE: exact source, merge parents, source delta and hashes", flush=True)
+          run("git", "worktree", "add", "--detach", str(SRC), SOURCE)
+          assert run("git", "rev-parse", "HEAD", cwd=SRC) == SOURCE
+          assert run("git", "status", "--porcelain", cwd=SRC) == ""
+          parents = run("git", "rev-parse", "HEAD^1", "HEAD^2", cwd=SRC).splitlines()
+          assert parents == [UPSTREAM, REVIEWED]
+          assert run("git", "rev-parse", "HEAD^{tree}", cwd=SRC) == run(
+              "git", "rev-parse", REVIEWED + "^{tree}", cwd=SRC)
+          names = sorted(run("git", "diff", "--name-only", UPSTREAM, SOURCE, cwd=SRC).splitlines())
+          assert names == EXPECTED, names
+          stats = [line.split("\t", 2) for line in run("git", "diff", "--numstat", UPSTREAM, SOURCE, cwd=SRC).splitlines()]
+          assert len(stats) == 9 and sum(int(row[0]) for row in stats) == 413 and sum(int(row[1]) for row in stats) == 8
+          REPORT["parents"] = parents
+          REPORT["source_delta"] = {"files": names, "additions": 413, "deletions": 8}
+          source_hashes = {path: digest(SRC / path) for path in RUNTIME}
+          REPORT["source_runtime_sha256"] = source_hashes
+          (EVIDENCE / "source-runtime-sha256.txt").write_text(
+              "".join(f"{sha}  {path}\n" for path, sha in source_hashes.items()))
+          secret_content = re.compile(rb"(?:-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{30,}|sk-(?:proj-)?[A-Za-z0-9_-]{35,})")
+          for path in RUNTIME:
+              assert not secret_content.search((SRC / path).read_bytes()), "Potential secret in overlay source: " + path
+
+          print("Pulling the exact pinned linux/amd64 base")
+          print(run("docker", "pull", "--platform", "linux/amd64", BASE))
+          base = json.loads(run("docker", "inspect", BASE))[0]
+          assert base["Architecture"] == "amd64" and base["Os"] == "linux"
+          assert BASE in base["RepoDigests"], base["RepoDigests"]
+          manifest = json.loads(run("docker", "buildx", "imagetools", "inspect", "--raw", BASE))
+          descriptors = [item for item in manifest.get("manifests", [])
+                         if item.get("platform", {}).get("architecture") == "amd64"
+                         and item.get("platform", {}).get("os") == "linux"]
+          assert len(descriptors) == 1, "Expected one linux/amd64 descriptor in pinned index"
+          REPORT["base_amd64_manifest_digest"] = descriptors[0]["digest"]
+          REPORT["base_image_id"] = base["Id"]
+          REPORT["base_repo_digests"] = base["RepoDigests"]
+          dockerfile = ROOT / "Dockerfile"
+          dockerfile.write_text("FROM " + BASE + "\n" + "".join(f"COPY {path} /app/{path}\n" for path in RUNTIME))
+          assert len(dockerfile.read_text().splitlines()) == 5
+          print(run("docker", "build", "--platform", "linux/amd64", "--network=none",
+                    "--tag", TAG, "--file", str(dockerfile), str(SRC)))
+          print("GATE: inherited image configuration and base layers", flush=True)
+          image = json.loads(run("docker", "inspect", TAG))[0]
+          assert image["Architecture"] == "amd64" and image["Os"] == "linux"
+          for key in ("Entrypoint", "Cmd", "WorkingDir", "Env", "User"):
+              assert image["Config"].get(key) == base["Config"].get(key), key
+          assert image["Config"]["Entrypoint"] == ["/entrypoint.sh"]
+          assert image["Config"]["WorkingDir"] == "/app"
+          base_layers, image_layers = base["RootFS"]["Layers"], image["RootFS"]["Layers"]
+          assert image_layers[:len(base_layers)] == base_layers
+          assert len(image_layers) == len(base_layers) + 4
+          for entry in image["Config"].get("Env", []):
+              name, _, value = entry.partition("=")
+              if re.search(r"(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|GITHUB_TOKEN|OPENAI_KEY|PASSWORD|CREDENTIAL|SECRET)", name, re.I):
+                  assert not value, "Unexpected nonempty credential environment variable: " + name
+          REPORT["image_id"] = image["Id"]
+          REPORT["config_digest"] = image["Id"]
+          REPORT["repo_digests"] = image.get("RepoDigests", [])
+          REPORT["platform"] = "linux/amd64"
+          REPORT["image_created"] = image["Created"]
+          REPORT["image_configuration"] = {key: image["Config"].get(key) for key in ("Entrypoint", "Cmd", "WorkingDir", "Env", "User")}
+
+          ENV = ["-e", "LITELLM_LOCAL_MODEL_COST_MAP=True", "-e", "PYTHONDONTWRITEBYTECODE=1",
+                 "-e", "OTEL_SDK_DISABLED=true", "-e", "AWS_EC2_METADATA_DISABLED=true"]
+
+
+          def container(reference, code):
+              return run("docker", "run", "--rm", "--network=none", *ENV,
+                         "--entrypoint", "python", reference, "-B", "-c", code)
+
+
+          hash_code = "import hashlib,json;from pathlib import Path;print(json.dumps({p:hashlib.sha256(Path('/app',p).read_bytes()).hexdigest() for p in " + repr(RUNTIME) + "}))"
+          print("GATE: runtime hashes, unchanged upstream files, entrypoint and history", flush=True)
+          image_hashes = json.loads(container(TAG, hash_code))
+          assert image_hashes == source_hashes
+          REPORT["image_runtime_sha256"] = image_hashes
+          (EVIDENCE / "image-runtime-sha256.txt").write_text(
+              "".join(f"{sha}  /app/{path}\n" for path, sha in image_hashes.items()))
+          unchanged = ["pr_agent/agent/pr_agent.py", "pr_agent/algo/utils.py",
+                       "pr_agent/git_providers/github_provider.py", "pr_agent/algo/ai_handlers/litellm_ai_handler.py",
+                       "pr_agent/algo/ai_handlers/base_ai_handler.py"]
+          spot_code = "import hashlib,json;from pathlib import Path;print(json.dumps({p:hashlib.sha256(Path('/app',p).read_bytes()).hexdigest() for p in " + repr(unchanged) + "}))"
+          stock_hashes = json.loads(container(BASE, spot_code))
+          assert json.loads(container(TAG, spot_code)) == stock_hashes
+          REPORT["unchanged_upstream_sha256"] = stock_hashes
+          entrypoint_code = "import os,json,hashlib;from pathlib import Path;p=Path('/entrypoint.sh');assert p.is_file() and os.access(p,os.X_OK);print(json.dumps({'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'executable':True}))"
+          entrypoint = json.loads(container(TAG, entrypoint_code))
+          assert entrypoint == json.loads(container(BASE, entrypoint_code))
+          REPORT["entrypoint_file"] = entrypoint
+          history = [json.loads(line) for line in run("docker", "history", "--no-trunc", "--format", "{{json .}}", TAG).splitlines()]
+          stock_history = [json.loads(line) for line in run("docker", "history", "--no-trunc", "--format", "{{json .}}", BASE).splitlines()]
+          assert len(history) == len(stock_history) + 4
+          assert [row["CreatedBy"] for row in history[4:]] == [row["CreatedBy"] for row in stock_history]
+          for row, path in zip(history[:4], reversed(RUNTIME), strict=True):
+              assert row["CreatedBy"].startswith("COPY ") and path in row["CreatedBy"], row["CreatedBy"]
+          REPORT["overlay_history"] = [row["CreatedBy"] for row in history[:4]]
+          (EVIDENCE / "docker-history.txt").write_text("\n".join(json.dumps(row) for row in history) + "\n")
+
+          scan_code = r'''
+          import json,re
+          from pathlib import Path
+          pattern = re.compile(rb"(?:-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{30,}|sk-(?:proj-)?[A-Za-z0-9_-]{35,})")
+          findings=[]
+          for root in (Path('/app'), Path('/root')):
+              for p in root.rglob('*'):
+                  if not p.is_file() or p.is_symlink(): continue
+                  candidate = p.name == '.env' or p.name.startswith('.env.') or p.name == '.secrets.toml' or p.suffix in ('.pem','.key') or str(p).endswith('/.docker/config.json')
+                  if candidate:
+                      data=p.read_bytes()
+                      template=p.name.endswith(('.example','.sample','.template'))
+                      if pattern.search(data) or (data.strip() and not template and p.name in ('.env','.secrets.toml','config.json')):
+                          findings.append(str(p))
+          assert not findings, 'Potential secret files detected (values withheld): '+repr(findings)
+          print(json.dumps({'credential_file_scan':'PASS','roots':['/app','/root'],'values_logged':False}))
+          '''
+          REPORT["secret_inspection"] = json.loads(container(TAG, scan_code))
+          print("GATE: actual-image CLI, real handler, scheduling, cancellation, pacing and cache", flush=True)
+          smoke_script = Path(os.environ["RUNNER_TEMP"]) / "qualification_smoke.py"
+          smoke_stdout = run("docker", "run", "--rm", "--network=none", *ENV, "-e", "PYTHONASYNCIODEBUG=1",
+                             "--mount", f"type=bind,source={smoke_script},target=/qualification_smoke.py,readonly",
+                             "--mount", f"type=bind,source={EVIDENCE},target=/evidence",
+                             "--entrypoint", "python", TAG, "-B", "/qualification_smoke.py")
+          print(smoke_stdout)
+          REPORT["smoke_results"] = json.loads((EVIDENCE / "smoke-results.json").read_text())
+          help_output = run("docker", "run", "--rm", "--network=none", *ENV,
+                            "--entrypoint", "python", TAG, "-B", "-m", "pr_agent.cli", "--help")
+          assert "usage:" in help_output.lower()
+          entrypoint_output = run("docker", "run", "--rm", "--network=none", *ENV, TAG)
+          assert "GITHUB_EVENT_NAME not set" in entrypoint_output
+          REPORT["entrypoint_smoke"] = "PASS: inherited entrypoint exits safely without event environment"
+          REPORT["cli_help_smoke"] = "PASS"
+          assert run("git", "status", "--porcelain", cwd=SRC) == ""
+          (EVIDENCE / "docker-inspect.json").write_text(json.dumps({"base": base, "overlay": image}, indent=2) + "\n")
+
+          # Only after EVERY gate passes, save the qualified image into the upload bundle.
+          print("ALL SMOKE GATES PASSED: saving exact local image and inspecting archive payload", flush=True)
+          qualified_tar = EVIDENCE / "publichunts-pr-agent-22de14dc-qualified.tar"
+          run("docker", "save", "--output", str(qualified_tar), TAG)
+          # Inspect the saved archive before allowing it to become an Actions artifact.
+          import tarfile
+          with tarfile.open(qualified_tar) as archive:
+              manifests = json.load(archive.extractfile("manifest.json"))
+              assert len(manifests) == 1
+              layers = manifests[0]["Layers"]
+              assert len(layers) == len(image_layers)
+              files = []
+              for layer_path in layers[-4:]:
+                  with tarfile.open(fileobj=archive.extractfile(layer_path), mode="r|*") as layer:
+                      for member in layer:
+                          if member.isfile():
+                              files.append(member.name.removeprefix("./"))
+              assert sorted(files) == sorted("app/" + path for path in RUNTIME), files
+          REPORT["overlay_layer_files"] = files
+          REPORT["qualified_tar"] = qualified_tar.name
+          REPORT["qualified_tar_sha256"] = digest(qualified_tar)
+          (EVIDENCE / (qualified_tar.name + ".sha256")).write_text(REPORT["qualified_tar_sha256"] + "  " + qualified_tar.name + "\n")
+          REPORT["result"] = "PASS"
+          REPORT["publication"] = "NONE: local image and Actions artifact only"
+          REPORT["production_digest"] = "NOT QUALIFIED: local image/config ID is not a GHCR manifest digest"
+          (EVIDENCE / "qualification-report.txt").write_text(json.dumps(REPORT, indent=2) + "\n")
+          print(json.dumps(REPORT, indent=2))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+              stream.write("evidence=" + str(EVIDENCE) + "\n")
+          QUALIFICATION_RUNNER
+          cat > "$RUNNER_TEMP/qualification_smoke.py" <<'QUALIFICATION_SMOKE'
+          """Offline smoke harness, mounted into (never copied into) the qualified image."""
+          import asyncio
+          import copy
+          import gc
+          import json
+          import logging
+          import socket
+          import tempfile
+          import warnings
+          from pathlib import Path
+          from types import SimpleNamespace
+          from unittest.mock import AsyncMock, Mock, patch
+
+          network_attempts = []
+
+
+          def deny_network(*args, **kwargs):
+              network_attempts.append("network attempt")
+              raise AssertionError("Network access is forbidden in qualification")
+
+
+          socket.socket.connect = deny_network
+          socket.socket.connect_ex = deny_network
+          socket.create_connection = deny_network
+
+          from dynaconf import Dynaconf
+          from starlette_context import request_cycle_context
+
+          from pr_agent.agent import pr_agent as agent
+          from pr_agent.algo.cli_args import CliArgs
+          from pr_agent.config_loader import dynconf_kwargs, get_settings
+          from pr_agent.tools.pr_reviewer import PRReviewer
+          import pr_agent.config_security
+
+          RESULTS = {"imports": "PASS", "network_isolation": "Docker --network=none plus Python socket guard"}
+          SETTINGS = copy.deepcopy(get_settings())
+          assert SETTINGS.pr_reviewer.parallel_calls is True
+          assert SETTINGS.pr_reviewer.inter_call_delay_seconds == 0
+          RESULTS["defaults"] = {"parallel_calls": True, "inter_call_delay_seconds": 0}
+
+          with tempfile.TemporaryDirectory() as directory:
+              trusted = Path(directory) / "trusted.toml"
+              trusted.write_text("[pr_reviewer]\nparallel_calls=false\ninter_call_delay_seconds=65\n")
+              parsed = Dynaconf(envvar_prefix=False, load_dotenv=False, settings_files=[str(trusted)], **dynconf_kwargs)
+              assert parsed.pr_reviewer.parallel_calls is False
+              assert parsed.pr_reviewer.inter_call_delay_seconds == 65
+          RESULTS["trusted_configuration"] = {"parallel_calls": False, "inter_call_delay_seconds": 65}
+
+          ATTACKS = [
+              f"--{section}{before}{separator}{after}{key}={value}"
+              for section in ("pr_reviewer", "PR_REVIEWER")
+              for separator in (".", "__")
+              for before, after in (("", ""), (" ", ""), ("\t", ""), ("", " "), ("", "\t"), (" ", " "))
+              for key, value in (("parallel_calls", "true"), ("inter_call_delay_seconds", "1000000000"))
+          ] + [
+              '--pr_reviewer={"parallel_calls": true}',
+              '--pr_reviewer={"inter_call_delay_seconds": 1000000000}',
+              '--pr_reviewer={"num_max_findings": 5, "parallel_calls": true}',
+              '--pr_reviewer={" parallel_calls": true}',
+              '--pr_reviewer={"parallel_calls ": true}',
+              '--PR_REVIEWER={"INTER_CALL_DELAY_SECONDS": 1000000000}',
+          ]
+          for argument in ATTACKS:
+              allowed, offending = CliArgs.validate_user_args([argument])
+              assert allowed is False and offending, argument
+          assert CliArgs.validate_user_args(["--pr_reviewer.num_max_findings=5"]) == (True, "")
+          RESULTS["cli_security"] = {"rejected": len(ATTACKS), "ordinary_dotted_override": "PASS"}
+
+
+          def configure(delay=0):
+              settings = get_settings()
+              settings.set("pr_reviewer.enable_large_pr_chunking", True)
+              settings.set("pr_reviewer.max_number_of_calls", 8)
+              settings.set("pr_reviewer.parallel_calls", False)
+              settings.set("pr_reviewer.inter_call_delay_seconds", delay)
+              settings.set("config.max_model_tokens", 10000)
+
+
+          def output(label):
+              return json.dumps({"review": {
+                  "score": 80,
+                  "security_concerns": "No",
+                  "key_issues_to_review": [{
+                      "relevant_file": label + ".py", "issue_header": "Possible Issue",
+                      "issue_content": "Check " + label, "start_line": 1, "end_line": 1,
+                  }],
+              }})
+
+
+          def reviewer(chunks):
+              instance = PRReviewer.__new__(PRReviewer)
+              instance.git_provider = Mock()
+              instance.ai_handler = SimpleNamespace()
+              instance.token_handler = SimpleNamespace(prompt_tokens=0, count_tokens=len)
+              instance.pr_url = "https://example.invalid/pr/1"
+              instance.vars = {}
+              instance.patches_diff = ""
+              instance._chunked_patches_diff_list = list(chunks)
+              instance._chunked_remaining_files_list = []
+              instance._chunked_primary_model = "gpt-4o-mini"
+              instance._chunked_results = {}
+              return instance
+
+
+          async def handler_security():
+              for argument in ATTACKS:
+                  quoted = argument.replace("\\", "\\\\").replace('"', '\\"')
+                  for request in (f'/review "{quoted}"', ["/review", argument]):
+                      updater = Mock(wraps=agent.update_settings_from_args)
+                      tool = Mock()
+                      tool.run = AsyncMock()
+                      factory, ai, notify = Mock(return_value=tool), Mock(), Mock()
+                      get_settings().set("pr_reviewer.parallel_calls", False)
+                      get_settings().set("pr_reviewer.inter_call_delay_seconds", 65)
+                      with (
+                          patch.object(agent, "apply_repo_settings", return_value=None),
+                          patch.object(agent, "update_settings_from_args", updater),
+                          patch.dict(agent.command2class, {"review": factory}),
+                      ):
+                          handled = await agent.PRAgent(ai_handler=ai)._handle_request(
+                              "https://example.invalid/pr/1", request, notify)
+                      assert handled is False
+                      assert get_settings().pr_reviewer.parallel_calls is False
+                      assert get_settings().pr_reviewer.inter_call_delay_seconds == 65
+                      updater.assert_not_called()
+                      factory.assert_not_called()
+                      tool.run.assert_not_awaited()
+                      ai.assert_not_called()
+                      notify.assert_not_called()
+              RESULTS["real_handler"] = {"rejected_before_mutation_or_execution": len(ATTACKS) * 2}
+
+
+          async def sequential():
+              configure()
+              instance = reviewer(["A", "B"])
+              events, tasks = [], []
+              parent = asyncio.current_task()
+              active = 0
+
+              async def predict(model, chunk):
+                  nonlocal active
+                  assert active == 0
+                  active += 1
+                  tasks.append(asyncio.current_task())
+                  assert tasks[-1] is not parent
+                  events.append("start " + chunk)
+                  await asyncio.sleep(0)
+                  events.append("end " + chunk)
+                  active -= 1
+                  return output(chunk)
+
+              instance._get_prediction = predict
+              assert await instance._prepare_chunked_prediction("gpt-4o-mini") is True
+              assert events == ["start A", "end A", "start B", "end B"]
+              assert len(set(tasks)) == 2 and all(task.done() for task in tasks)
+              RESULTS["sequential"] = events
+
+
+          async def self_cancel():
+              configure()
+              instance = reviewer(["A", "B"])
+              parent = asyncio.current_task()
+              tasks, calls = [], []
+
+              async def predict(model, chunk):
+                  calls.append(chunk)
+                  tasks.append(asyncio.current_task())
+                  assert tasks[-1] is not parent
+                  if chunk == "A":
+                      asyncio.current_task().cancel()
+                      await asyncio.sleep(0)
+                      raise AssertionError("Self-cancellation did not occur")
+                  return output(chunk)
+
+              instance._get_prediction = predict
+              try:
+                  await instance._prepare_chunked_prediction("gpt-4o-mini")
+              except asyncio.CancelledError:
+                  pass
+              else:
+                  raise AssertionError("Expected stock-equivalent downstream CancelledError")
+              assert calls == ["A", "B"]
+              assert parent.cancelling() == 0
+              assert len(set(tasks)) == 2 and all(task.done() for task in tasks)
+              assert tasks[0].cancelled() and not tasks[1].cancelled()
+              RESULTS["self_cancellation"] = "PASS: isolated children, B dispatched, parent not cancelling"
+
+
+          async def caller_cancel():
+              configure()
+              instance = reviewer(["A", "B"])
+              started, cancelled, blocked = asyncio.Event(), asyncio.Event(), asyncio.Event()
+              calls, children = [], []
+
+              async def predict(model, chunk):
+                  calls.append(chunk)
+                  children.append(asyncio.current_task())
+                  started.set()
+                  try:
+                      await blocked.wait()
+                  except asyncio.CancelledError:
+                      cancelled.set()
+                      raise
+                  raise AssertionError("Unexpected completion")
+
+              instance._get_prediction = predict
+              parent = asyncio.create_task(instance._prepare_chunked_prediction("gpt-4o-mini"))
+              await asyncio.wait_for(started.wait(), 2)
+              parent.cancel()
+              try:
+                  await parent
+              except asyncio.CancelledError:
+                  pass
+              else:
+                  raise AssertionError("Caller cancellation did not propagate")
+              assert calls == ["A"] and cancelled.is_set()
+              assert parent.cancelled() and all(child.done() and child.cancelled() for child in children)
+              RESULTS["caller_cancellation"] = "PASS: active child cancelled, B never started"
+
+
+          async def pacing():
+              configure(65)
+              events = []
+              instance = reviewer(["A", "B", "C"])
+
+              async def predict(model, chunk):
+                  events.append("call " + chunk)
+                  return output(chunk)
+
+              async def sleep(delay):
+                  assert delay == 65
+                  events.append("sleep 65")
+
+              instance._get_prediction = predict
+              with patch("asyncio.sleep", sleep):
+                  assert await instance._prepare_chunked_prediction("gpt-4o-mini") is True
+              assert events == ["call A", "sleep 65", "call B", "sleep 65", "call C"]
+              RESULTS["pacing"] = list(events)
+              events.clear()
+              instance = reviewer(["0", "1", "2", "3"])
+              cached = {}
+              for index in (0, 2):
+                  raw = output(str(index))
+                  cached[index] = (raw, instance._load_valid_review_yaml(raw), "gpt-4o-mini")
+              instance._chunked_results = cached.copy()
+              instance._get_prediction = predict
+              with patch("asyncio.sleep", sleep):
+                  assert await instance._prepare_chunked_prediction("gpt-4o-mini") is True
+              assert events == ["call 1", "sleep 65", "call 3"]
+              assert all(instance._chunked_results[index] is cached[index] for index in (0, 2))
+              RESULTS["cached_gap_pacing"] = list(events)
+
+
+          async def fallback_cache():
+              configure()
+              instance = reviewer(["A", "B", "C"])
+              calls = []
+              attempts = 0
+
+              async def predict(model, chunk):
+                  calls.append(chunk)
+                  if chunk == "B" and attempts == 0:
+                      raise RuntimeError("Offline simulated prediction failure")
+                  return output(chunk)
+
+              instance._get_prediction = predict
+              try:
+                  await instance._prepare_chunked_prediction("gpt-4o-mini")
+              except RuntimeError:
+                  pass
+              else:
+                  raise AssertionError("Expected simulated first-attempt failure")
+              assert list(instance._chunked_results) == [0, 2]
+              cached = instance._chunked_results.copy()
+              attempts += 1
+              assert await instance._prepare_chunked_prediction("gpt-4o-mini") is True
+              assert calls == ["A", "B", "C", "B"]
+              assert all(instance._chunked_results[index] is cached[index] for index in (0, 2))
+              issues = instance.prediction_data["review"]["key_issues_to_review"]
+              assert [issue["relevant_file"].strip() for issue in issues] == ["A.py", "B.py", "C.py"]
+              assert len(issues) == 3
+              RESULTS["fallback_cache"] = {"calls": calls, "findings_order": ["A.py", "B.py", "C.py"]}
+
+
+          class AsyncDiagnostics(logging.Handler):
+              def __init__(self):
+                  super().__init__()
+                  self.errors = []
+
+              def emit(self, record):
+                  message = record.getMessage()
+                  if "Task was destroyed" in message or "exception was never retrieved" in message:
+                      self.errors.append(message)
+
+
+          async def main():
+              loop = asyncio.get_running_loop()
+              errors = []
+              loop.set_exception_handler(lambda _loop, context: errors.append(context.get("message", "async error")))
+              with request_cycle_context({"settings": SETTINGS}):
+                  for check in (handler_security, sequential, self_cancel, caller_cancel, pacing, fallback_cache):
+                      await check()
+                      await asyncio.sleep(0)
+                      assert not [task for task in asyncio.all_tasks() if task is not asyncio.current_task() and not task.done()]
+              gc.collect()
+              await asyncio.sleep(0)
+              assert not errors, errors
+              assert not network_attempts, "Unexpected network attempt"
+              RESULTS["async_cleanup"] = "PASS: debug enabled, no surviving tasks or loop errors"
+              RESULTS["live_model_calls"] = 0
+
+
+          diagnostics = AsyncDiagnostics()
+          logging.getLogger("asyncio").addHandler(diagnostics)
+          with warnings.catch_warnings(record=True) as captured:
+              warnings.simplefilter("always")
+              asyncio.run(main(), debug=True)
+              gc.collect()
+              assert not diagnostics.errors, diagnostics.errors
+              assert not [warning for warning in captured if "was never awaited" in str(warning.message)]
+          Path("/evidence/smoke-results.json").write_text(json.dumps(RESULTS, indent=2) + "\n")
+          print(json.dumps(RESULTS, indent=2))
+          QUALIFICATION_SMOKE
+          python3 "$RUNNER_TEMP/qualification_runner.py"
+      - name: Upload qualified image and evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: publichunts-pr-agent-qualified-22de14dc
+          path: ${{ steps.qualification.outputs.evidence }}/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
