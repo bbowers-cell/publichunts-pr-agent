@@ -1,0 +1,372 @@
+name: Publish exact qualified PR-Agent image
+
+on:
+  push:
+    branches:
+      - ci/qualify-pr-agent-image-22de14dc
+    paths:
+      - .github/workflows/publish-qualified-pr-agent-image.yml
+
+permissions:
+  contents: read
+  actions: read
+  packages: write
+
+jobs:
+  publish-exact-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout one-time publication commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify artifact, load exact image, publish once, and verify digest round-trip
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/publication_runner.py" <<'EXACT_PUBLICATION'
+          """Publish the exact qualified archive once; never build an image."""
+          import hashlib
+          import json
+          import os
+          import re
+          import shutil
+          import subprocess
+          import time
+          import urllib.error
+          import urllib.request
+          import zipfile
+          from pathlib import Path
+
+          REPO = "bbowers-cell/publichunts-pr-agent"
+          PARENT = "e41633eec265e31e0631474d277b300425825bd1"
+          SOURCE = "22de14dc5563c3618cc995bd354e64cd79893bc3"
+          BRANCH = "ci/qualify-pr-agent-image-22de14dc"
+          WORKFLOW = ".github/workflows/publish-qualified-pr-agent-image.yml"
+          ARTIFACT = 11290950889
+          QUALIFICATION_RUN = 37169676697
+          ARCHIVE_SHA = "99b778cb76f0232df324b91e4f0ccc13d47b0fb6b65440e1488f524c439153f8"
+          TAR_NAME = "publichunts-pr-agent-22de14dc-qualified.tar"
+          TAR_SHA = "479582922e61a7129f66f5502dbdb91eee00ae2b7c46db3631924ef4b3b8881f"
+          IMAGE = "sha256:0edf2ac4e43fb27c6a82a6defc6e583a337f7d8fa1565a59f9392b13b908db19"
+          BASE = "pragent/pr-agent@sha256:31b9aac6ab067bada9a0c1b001d30ebc500ea4487e00a93c18c59b9ef5fa66db"
+          REGISTRY_REPOSITORY = "ghcr.io/bbowers-cell/publichunts-pr-agent"
+          TAG = REGISTRY_REPOSITORY + ":qualified-22de14dc"
+          LOCAL_TAG = "publichunts-pr-agent:qualification-22de14dc"
+          EXPECTED = {
+              "pr_agent/algo/cli_args.py": "3e2560b9b7a967a4bae91533206e1ab492b20ce5e4d3e2075c6ef963bca7ef35",
+              "pr_agent/tools/pr_reviewer.py": "2eb0ead8a3d1775703160fa518c317b7dfc5d86f9d626231a7893f59939322c1",
+              "pr_agent/config_security.py": "e88fca9ea79899dd34caf663f5a86dab029abf28c33ff449de2c108add1c9256",
+              "pr_agent/settings/configuration.toml": "0bc4a3eedc52259b6a5202a3a153d072a46829a3a8ff4901adb3ef7f57424703",
+          }
+          ROOT = Path(os.environ["RUNNER_TEMP"]) / "exact-image-publication"
+          ROOT.mkdir()
+          EVIDENCE = ROOT / "evidence"
+          EVIDENCE.mkdir()
+          TOKEN = os.environ["GH_TOKEN"]
+          REPORT = {"source_commit": SOURCE, "workflow_commit": os.environ["GITHUB_SHA"],
+                    "publication_run_id": os.environ["GITHUB_RUN_ID"], "artifact_id": ARTIFACT,
+                    "qualification_run_id": QUALIFICATION_RUN, "published_tag": TAG,
+                    "rebuilt": False, "registry_login": "NOT ATTEMPTED", "push": "NOT ATTEMPTED"}
+
+
+          def record():
+              (EVIDENCE / "publication-report.json").write_text(json.dumps(REPORT, indent=2) + "\n")
+              print(json.dumps(REPORT, indent=2), flush=True)
+
+
+          def run(*command, input_text=None):
+              result = subprocess.run(command, input=input_text, text=True, capture_output=True, timeout=1200)
+              if result.returncode:
+                  # Do not print login output or any credential-bearing request.
+                  if command[:2] != ("docker", "login"):
+                      print((result.stdout or "")[-6000:], flush=True)
+                      print((result.stderr or "")[-6000:], flush=True)
+                  raise RuntimeError("Command failed: " + " ".join(command[:2]) + ", exit " + str(result.returncode))
+              return result.stdout.strip()
+
+
+          def api(path):
+              request = urllib.request.Request("https://api.github.com/" + path, headers={
+                  "Authorization": "Bearer " + TOKEN, "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "exact-qualified-image-publication",
+              })
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+
+
+          def sha(path):
+              with path.open("rb") as stream:
+                  return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+          print("GATE: one-time publication commit identity before artifact download/login", flush=True)
+          assert os.environ["GITHUB_REPOSITORY"] == REPO
+          assert os.environ["GITHUB_REF"] == "refs/heads/" + BRANCH
+          assert os.environ["GITHUB_EVENT_NAME"] == "push"
+          assert run("git", "rev-parse", "HEAD") == os.environ["GITHUB_SHA"]
+          assert run("git", "rev-parse", "HEAD^1") == PARENT
+          assert len(run("git", "rev-list", "--parents", "-n", "1", "HEAD").split()) == 2
+          assert run("git", "diff", "--name-only", "HEAD^", "HEAD").splitlines() == [WORKFLOW]
+          assert run("git", "status", "--porcelain") == ""
+
+          # The unchanged qualification workflow also receives this push. The desktop
+          # controller cancels only that fresh duplicate run; never permit its build step.
+          deadline = time.monotonic() + 180
+          while True:
+              runs = api(f"repos/{REPO}/actions/runs?head_sha={os.environ['GITHUB_SHA']}&event=push&per_page=100")
+              assert not runs.get("total_count", 0) > 100
+              duplicates = [item for item in runs["workflow_runs"]
+                            if item["path"] == ".github/workflows/qualify-pr-agent-image.yml"]
+              assert len(duplicates) <= 1
+              if duplicates and duplicates[0]["status"] == "completed":
+                  duplicate = duplicates[0]
+                  assert duplicate["conclusion"] == "cancelled", "Duplicate qualification run was not cancelled"
+                  jobs = api(f"repos/{REPO}/actions/runs/{duplicate['id']}/jobs?per_page=100")
+                  for job in jobs["jobs"]:
+                      for step in job.get("steps", []):
+                          if step["name"] == "Verify source, build pinned overlay, and qualify offline":
+                              assert step["conclusion"] == "skipped", "Duplicate qualification build step started"
+                  REPORT["cancelled_duplicate_qualification_run"] = duplicate["id"]
+                  break
+              assert time.monotonic() < deadline, "Duplicate-run cancellation could not be verified; stop before download/login"
+              time.sleep(3)
+
+          print("GATE: exact qualification run and artifact", flush=True)
+          qualified_run = api(f"repos/{REPO}/actions/runs/{QUALIFICATION_RUN}")
+          assert qualified_run["status"] == "completed" and qualified_run["conclusion"] == "success"
+          assert qualified_run["head_sha"] == PARENT and qualified_run["head_branch"] == BRANCH
+          artifact = api(f"repos/{REPO}/actions/artifacts/{ARTIFACT}")
+          assert artifact["id"] == ARTIFACT and artifact["name"] == "publichunts-pr-agent-qualified-22de14dc"
+          assert artifact["expired"] is False and artifact["digest"] == "sha256:" + ARCHIVE_SHA
+          assert artifact["workflow_run"]["id"] == QUALIFICATION_RUN
+          assert artifact["workflow_run"]["head_sha"] == PARENT
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, response, code, message, headers, new_url):
+                  return None
+
+
+          archive = ROOT / "qualified-artifact.zip"
+          request = urllib.request.Request(f"https://api.github.com/repos/{REPO}/actions/artifacts/{ARTIFACT}/zip",
+              headers={"Authorization": "Bearer " + TOKEN, "Accept": "application/vnd.github+json",
+                       "User-Agent": "exact-qualified-image-publication"})
+          try:
+              response = urllib.request.build_opener(NoRedirect()).open(request, timeout=60)
+          except urllib.error.HTTPError as error:
+              assert error.code == 302, "Artifact transport did not return the expected redirect"
+              location = error.headers["Location"]
+              assert location.startswith("https://")
+              # Signed storage URL receives NO GitHub Authorization header and is never logged.
+              response = urllib.request.urlopen(location, timeout=120)
+          with response, archive.open("wb") as stream:
+              shutil.copyfileobj(response, stream)
+          archive_sha = sha(archive)
+          assert archive_sha == ARCHIVE_SHA, "Raw Actions artifact ZIP digest mismatch; stop before login"
+          REPORT["artifact_archive_sha256"] = archive_sha
+          REPORT["artifact_archive_digest_match"] = True
+
+          required = {TAR_NAME, TAR_NAME + ".sha256", "qualification-report.txt", "source-runtime-sha256.txt",
+                      "image-runtime-sha256.txt", "docker-inspect.json", "docker-history.txt",
+                      "settings-initialization.json", "smoke-results.json"}
+          bundle = ROOT / "qualified-bundle"
+          bundle.mkdir()
+          with zipfile.ZipFile(archive) as zipped:
+              assert len(zipped.namelist()) == len(required) and set(zipped.namelist()) == required
+              for info in zipped.infolist():
+                  assert not info.is_dir() and "/" not in info.filename and "\\" not in info.filename
+                  assert (info.external_attr >> 16) & 0o170000 != 0o120000, "Artifact symlink forbidden"
+                  with zipped.open(info) as source, (bundle / info.filename).open("wb") as target:
+                      shutil.copyfileobj(source, target)
+          tar = bundle / TAR_NAME
+          assert sha(tar) == TAR_SHA
+          assert (bundle / (TAR_NAME + ".sha256")).read_text().split() == [TAR_SHA, TAR_NAME]
+          qualification = json.loads((bundle / "qualification-report.txt").read_text())
+          assert qualification["result"] == "PASS" and qualification["source_commit"] == SOURCE
+          assert qualification["base_reference"] == BASE and qualification["platform"] == "linux/amd64"
+          assert qualification["image_id"] == IMAGE and qualification["config_digest"] == IMAGE
+          assert qualification["qualified_tar"] == TAR_NAME and qualification["qualified_tar_sha256"] == TAR_SHA
+          assert qualification["source_runtime_sha256"] == qualification["image_runtime_sha256"] == EXPECTED
+          assert qualification["smoke_results"]["defaults"] == {"parallel_calls": True, "inter_call_delay_seconds": 0}
+          assert qualification["smoke_results"]["live_model_calls"] == 0
+          assert json.loads((bundle / "settings-initialization.json").read_text()) == qualification["settings_initialization"]
+          assert json.loads((bundle / "smoke-results.json").read_text()) == qualification["smoke_results"]
+          for name, prefix in (("source-runtime-sha256.txt", ""), ("image-runtime-sha256.txt", "/app/")):
+              entries = {}
+              for line in (bundle / name).read_text().splitlines():
+                  value, path = line.split(None, 1)
+                  assert path.startswith(prefix)
+                  normalized = path[len(prefix):]
+                  assert normalized not in entries
+                  entries[normalized] = value
+              assert entries == EXPECTED
+          saved_inspect = json.loads((bundle / "docker-inspect.json").read_text())
+          assert saved_inspect["overlay"]["Id"] == IMAGE
+          REPORT["tar_filename"] = TAR_NAME
+          REPORT["tar_sha256"] = TAR_SHA
+          REPORT["qualified_runtime_sha256"] = EXPECTED
+
+          print("GATE: Docker load, exact config/platform and pre-login runtime identity", flush=True)
+          print(run("docker", "load", "--input", str(tar)), flush=True)
+          loaded = json.loads(run("docker", "image", "inspect", IMAGE))[0]
+          assert loaded["Id"] == IMAGE and loaded["Architecture"] == "amd64" and loaded["Os"] == "linux"
+          assert loaded["Config"] == saved_inspect["overlay"]["Config"]
+          assert loaded["RootFS"] == saved_inspect["overlay"]["RootFS"]
+          assert loaded["Config"]["Entrypoint"] == ["/entrypoint.sh"] and loaded["Config"]["WorkingDir"] == "/app"
+          assert loaded["RepoTags"] == [LOCAL_TAG]
+          REPORT["loaded_image_id"] = loaded["Id"]
+
+
+          def verify_runtime(reference):
+              code = """import hashlib,json,os
+          from pathlib import Path
+          from pr_agent.config_loader import get_settings
+          paths=""" + repr(list(EXPECTED)) + """
+          settings=get_settings()
+          assert settings.pr_reviewer.parallel_calls is True
+          assert settings.pr_reviewer.inter_call_delay_seconds == 0
+          assert Path('/entrypoint.sh').is_file() and os.access('/entrypoint.sh',os.X_OK)
+          print(json.dumps({'hashes':{p:hashlib.sha256(Path('/app',p).read_bytes()).hexdigest() for p in paths},'defaults':{'parallel_calls':True,'inter_call_delay_seconds':0},'entrypoint_executable':True}))
+          """
+              result = run("docker", "run", "--rm", "--network=none", "-e", "PYTHONDONTWRITEBYTECODE=1",
+                           "-e", "LITELLM_LOCAL_MODEL_COST_MAP=True", "-e", "OTEL_SDK_DISABLED=true",
+                           "-e", "AWS_EC2_METADATA_DISABLED=true", "--entrypoint", "python", reference, "-B", "-c", code)
+              value = json.loads(result)
+              assert value["hashes"] == EXPECTED
+              return value
+
+
+          REPORT["pre_push_runtime"] = verify_runtime(IMAGE)
+          print("All pre-login artifact/load/runtime gates passed", flush=True)
+          record()
+
+          print("Authenticating to GHCR with the automatic workflow token", flush=True)
+          run("docker", "login", "ghcr.io", "--username", os.environ["GITHUB_ACTOR"],
+              "--password-stdin", input_text=TOKEN + "\n")
+          REPORT["registry_login"] = "PASS: automatic GITHUB_TOKEN only"
+
+          # Read the exact tag from the registry before any tag/push; only an authenticated
+          # manifest-unknown response permits publication. Permission/network errors stop.
+          import base64
+          import urllib.parse
+          credential = base64.b64encode((os.environ["GITHUB_ACTOR"] + ":" + TOKEN).encode()).decode()
+          token_request = urllib.request.Request(
+              "https://ghcr.io/token?" + urllib.parse.urlencode({"service": "ghcr.io", "scope": "repository:bbowers-cell/publichunts-pr-agent:pull"}),
+              headers={"Authorization": "Basic " + credential})
+          with urllib.request.urlopen(token_request, timeout=60) as response:
+              registry_token = json.load(response)["token"]
+          manifest_headers = {"Authorization": "Bearer " + registry_token,
+              "Accept": "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"}
+          existing_request = urllib.request.Request("https://ghcr.io/v2/bbowers-cell/publichunts-pr-agent/manifests/qualified-22de14dc", headers=manifest_headers)
+          tag_present = False
+          try:
+              with urllib.request.urlopen(existing_request, timeout=60) as response:
+                  tag_present = True
+                  existing = json.load(response)
+                  REPORT["existing_tag_manifest_digest"] = response.headers.get("Docker-Content-Digest")
+              if "manifests" in existing:
+                  candidates = [item for item in existing["manifests"]
+                                if item.get("platform", {}).get("os") == "linux"
+                                and item.get("platform", {}).get("architecture") == "amd64"]
+                  assert len(existing["manifests"]) == 1 and len(candidates) == 1, "Existing tag has unexpected platforms"
+                  child_digest = candidates[0]["digest"]
+                  assert re.fullmatch(r"sha256:[0-9a-f]{64}", child_digest)
+                  child_request = urllib.request.Request(
+                      "https://ghcr.io/v2/bbowers-cell/publichunts-pr-agent/manifests/" + child_digest,
+                      headers=manifest_headers)
+                  with urllib.request.urlopen(child_request, timeout=60) as response:
+                      existing = json.load(response)
+              REPORT["existing_tag_config_digest"] = existing.get("config", {}).get("digest")
+              REPORT["existing_tag_matches_qualified_config"] = REPORT["existing_tag_config_digest"] == IMAGE
+              if REPORT["existing_tag_matches_qualified_config"]:
+                  REPORT["existing_tag_qualified_source"] = SOURCE
+              REPORT["push"] = "STOPPED: tag already exists; not overwritten"
+              record()
+              raise RuntimeError("Publication tag already exists; inspect recorded identity and stop without push")
+          except urllib.error.HTTPError as error:
+              assert not tag_present, "Existing tag inspection failed; never overwrite it"
+              assert error.code == 404, "Existing-tag check failed; stop without push"
+              errors = json.load(error).get("errors", [])
+              assert errors and all(item["code"] in ("MANIFEST_UNKNOWN", "NAME_UNKNOWN") for item in errors)
+
+          run("docker", "tag", IMAGE, TAG)
+          REPORT["push"] = "STARTED: no automatic retry permitted"
+          record()
+          push_output = run("docker", "push", TAG)
+          print(push_output, flush=True)
+          matches = re.findall(r"digest:\s*(sha256:[0-9a-f]{64})", push_output)
+          assert len(set(matches)) == 1, "Push returned no unambiguous manifest digest"
+          published = matches[0]
+          REPORT["push"] = "PASS"
+          REPORT["published_manifest_digest"] = published
+          REPORT["immutable_reference"] = REGISTRY_REPOSITORY + "@" + published
+          record()  # Preserve the pushed identity before any post-push assertion.
+
+          def manifest(reference):
+              raw = run("docker", "buildx", "imagetools", "inspect", "--raw", reference)
+              return json.loads(raw)
+
+
+          descriptor = json.loads(run("docker", "buildx", "imagetools", "inspect", "--format", "{{json .Manifest}}", TAG))
+          assert descriptor["digest"] == published
+          top = manifest(REPORT["immutable_reference"])
+          if "manifests" in top:
+              assert len(top["manifests"]) == 1, "Unexpected alternate platform/image in top-level index"
+              child = top["manifests"][0]
+              assert child["platform"]["os"] == "linux" and child["platform"]["architecture"] == "amd64"
+              child_digest = child["digest"]
+              platform_manifest = manifest(REGISTRY_REPOSITORY + "@" + child_digest)
+              REPORT["top_level_index_digest"] = published
+          else:
+              child_digest = published
+              platform_manifest = top
+              REPORT["top_level_index_digest"] = None
+          assert platform_manifest["config"]["digest"] == IMAGE
+          assert len(platform_manifest["layers"]) == len(loaded["RootFS"]["Layers"])
+          REPORT["amd64_manifest_digest"] = child_digest
+          REPORT["published_config_digest"] = platform_manifest["config"]["digest"]
+          REPORT["registry_manifest_media_type"] = top["mediaType"]
+          (EVIDENCE / "published-manifest.json").write_text(json.dumps(top, indent=2) + "\n")
+
+          print("Forcing a registry round-trip: removing the loaded image before digest pull", flush=True)
+          run("docker", "image", "rm", "--force", IMAGE)
+          absent = subprocess.run(["docker", "image", "inspect", IMAGE], capture_output=True, text=True)
+          assert absent.returncode != 0, "Qualified image still exists locally; no valid forced round-trip"
+          REPORT["loaded_image_removed_before_pull"] = True
+          pull_output = run("docker", "pull", "--platform", "linux/amd64", REPORT["immutable_reference"])
+          print(pull_output, flush=True)
+          pulled = json.loads(run("docker", "image", "inspect", REPORT["immutable_reference"]))[0]
+          assert pulled["Id"] == IMAGE and pulled["Architecture"] == "amd64" and pulled["Os"] == "linux"
+          assert pulled["Config"] == loaded["Config"] and pulled["RootFS"] == loaded["RootFS"]
+          assert REPORT["immutable_reference"] in pulled["RepoDigests"]
+          REPORT["pulled_image_id"] = pulled["Id"]
+          REPORT["post_pull_runtime"] = verify_runtime(REPORT["immutable_reference"])
+          REPORT["platform"] = "linux/amd64"
+          REPORT["entrypoint"] = pulled["Config"]["Entrypoint"]
+          REPORT["working_directory"] = pulled["Config"]["WorkingDir"]
+          (EVIDENCE / "pulled-image-inspect.json").write_text(json.dumps(pulled, indent=2) + "\n")
+          try:
+              package = api("users/bbowers-cell/packages/container/publichunts-pr-agent")
+              REPORT["package_visibility"] = package["visibility"]
+          except urllib.error.HTTPError as error:
+              REPORT["package_visibility"] = "Unavailable: GitHub API HTTP " + str(error.code)
+          REPORT["package_permissions_changed"] = False
+          REPORT["only_published_tag"] = TAG
+          REPORT["live_model_calls"] = 0
+          REPORT["result"] = "PASS"
+          record()
+          EXACT_PUBLICATION
+          python3 "$RUNNER_TEMP/publication_runner.py"
+      - name: Retain publication verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: publichunts-pr-agent-publication-${{ github.sha }}
+          path: ${{ runner.temp }}/exact-image-publication/evidence/
+          if-no-files-found: warn
+          retention-days: 30
