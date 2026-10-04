@@ -778,13 +778,44 @@ async def test_chunk_base_exception_remains_a_result_until_existing_result_handl
 
 
 @pytest.mark.asyncio
+async def test_child_task_self_cancellation_does_not_stop_pending_dispatch(chunking_enabled):
+    reviewer = _make_reviewer()
+    parent = asyncio.current_task()
+    child_tasks = []
+    events = []
+
+    async def predict(_model, chunk):
+        child_tasks.append(asyncio.current_task())
+        events.append(chunk)
+        if chunk == "a":
+            asyncio.current_task().cancel()
+            await asyncio.sleep(0)  # Deliver actual task cancellation, not a manually raised exception.
+        return CHUNK_A
+
+    reviewer._get_prediction = AsyncMock(side_effect=predict)
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_pr_multi_diffs", return_value=(["a", "b"], [])),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await reviewer._prepare_chunked_prediction("model")
+    assert events == ["a", "b"]
+    assert [call.args for call in reviewer._get_prediction.await_args_list] == [("model", "a"), ("model", "b")]
+    assert all(child is not parent for child in child_tasks)
+    assert child_tasks[0] is not child_tasks[1]
+    assert child_tasks[0].cancelled()
+    assert parent.cancelling() == 0
+
+
+@pytest.mark.asyncio
 async def test_sequential_caller_cancellation_does_not_start_later_chunks(chunking_enabled):
     get_settings().set("pr_reviewer.parallel_calls", False)
     reviewer = _make_reviewer()
     started = asyncio.Event()
     blocked = asyncio.Event()
+    child_tasks = []
 
     async def predict(_model, _chunk):
+        child_tasks.append(asyncio.current_task())
         started.set()
         await blocked.wait()
 
@@ -796,6 +827,67 @@ async def test_sequential_caller_cancellation_does_not_start_later_chunks(chunki
         with pytest.raises(asyncio.CancelledError):
             await task
     assert reviewer._get_prediction.await_count == 1
+    assert child_tasks[0] is not task
+    assert child_tasks[0].cancelled()
+
+
+@pytest.mark.asyncio
+async def test_caller_cancellation_during_pacing_prevents_next_child(chunking_enabled):
+    get_settings().set("pr_reviewer.parallel_calls", False)
+    get_settings().set("pr_reviewer.inter_call_delay_seconds", 65)
+    reviewer = _make_reviewer()
+    reviewer._get_prediction = AsyncMock(return_value=CHUNK_A)
+    sleeping = asyncio.Event()
+    blocked = asyncio.Event()
+
+    async def sleep(seconds):
+        assert seconds == 65
+        sleeping.set()
+        await blocked.wait()
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_pr_multi_diffs", return_value=(["a", "b"], [])),
+        patch("pr_agent.tools.pr_reviewer.asyncio.sleep", new=AsyncMock(side_effect=sleep)),
+    ):
+        task = asyncio.create_task(reviewer._prepare_chunked_prediction("model"))
+        await asyncio.wait_for(sleeping.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert [call.args for call in reviewer._get_prediction.await_args_list] == [("model", "a")]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_fallback_retains_cached_success_and_stops_pending_dispatch(chunking_enabled):
+    get_settings().set("pr_reviewer.parallel_calls", False)
+    reviewer = _make_reviewer()
+    reviewer._get_prediction = AsyncMock(side_effect=[CHUNK_A, RuntimeError("failed b"), RuntimeError("failed c")])
+    started = asyncio.Event()
+    blocked = asyncio.Event()
+    child_tasks = []
+
+    async def predict(_model, _chunk):
+        child_tasks.append(asyncio.current_task())
+        started.set()
+        await blocked.wait()
+
+    with patch("pr_agent.tools.pr_reviewer.get_pr_multi_diffs", return_value=(["a", "b", "c"], [])):
+        with pytest.raises(RuntimeError, match="failed b"):
+            await reviewer._prepare_chunked_prediction("primary")
+        cached = reviewer._chunked_results[0]
+        reviewer._get_prediction.side_effect = predict
+        task = asyncio.create_task(reviewer._prepare_chunked_prediction("fallback"))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert reviewer._chunked_results == {0: cached}
+    assert reviewer._chunked_results[0] is cached
+    assert [call.args for call in reviewer._get_prediction.await_args_list] == [
+        ("primary", "a"), ("primary", "b"), ("primary", "c"), ("fallback", "b"),
+    ]
+    assert child_tasks[0] is not task
+    assert child_tasks[0].cancelled()
 
 
 @pytest.mark.asyncio

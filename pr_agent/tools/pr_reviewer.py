@@ -920,17 +920,10 @@ class PRReviewer:
             for position, index in enumerate(pending_indices):
                 if position and delay > 0:
                     await asyncio.sleep(delay)
-                try:
-                    prediction = await self._get_prediction(model, patches_diff_list[index])
-                except (KeyboardInterrupt, SystemExit):
-                    raise
-                except asyncio.CancelledError as error:
-                    # Match gather: propagate caller cancellation, retain a self-cancelled chunk as a result.
-                    if asyncio.current_task().cancelling():
-                        raise
-                    prediction = error
-                except BaseException as error:
-                    prediction = error
+                # A one-call gather preserves upstream child-task and exception semantics.
+                prediction, = await asyncio.gather(
+                    self._get_prediction(model, patches_diff_list[index]),
+                    return_exceptions=True)
                 predictions.append(prediction)
 
         chunk_errors = []

@@ -68,6 +68,13 @@ FORBIDDEN_ARGS = [
     "--pr_reviewer.publish_error_details=true",
     "--pr_reviewer__publish_error_details=true",
     '--pr_reviewer={"publish_error_details": true}',
+    # Scheduling is trusted root-/host-controlled, never comment-/CLI-controlled.
+    "--pr_reviewer.parallel_calls=true",
+    "--PR_REVIEWER.PARALLEL_CALLS=true",
+    "--pr_reviewer__parallel_calls=true",
+    "--pr_reviewer.inter_call_delay_seconds=1000000000",
+    "--pr_reviewer__inter_call_delay_seconds=1000000000",
+    '--pr_reviewer={"parallel_calls": true, "inter_call_delay_seconds": 1000000000}',
     # repo_context_max_sibling_files is host-only: letting a comment raise it would defeat the
     # sibling-fetch safety bound and allow unbounded cross-repository API calls.
     "--config.repo_context_max_sibling_files=1000",
@@ -196,6 +203,8 @@ def test_validate_user_args_all_allowed_together():
         "--github.webhook_secret=secret",
         "--openai__key=secret",
         "--push_outputs=enabled",
+        "--pr_reviewer.parallel_calls=true",
+        "--pr_reviewer.inter_call_delay_seconds=1000000000",
     ],
 )
 async def test_handle_request_uses_real_validator_to_block_forbidden(monkeypatch, forbidden):
