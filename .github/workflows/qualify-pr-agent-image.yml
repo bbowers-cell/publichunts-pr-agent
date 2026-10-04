@@ -147,6 +147,63 @@ jobs:
                          "--entrypoint", "python", reference, "-B", "-c", code)
 
 
+          # Fresh containers prove packaged loading before the corrected smoke harness runs.
+          print("GATE: stock/overlay settings initialization differential", flush=True)
+          settings_probe = r'''
+          """Fresh-process stock/overlay settings initialization diagnostic."""
+          import copy
+          import json
+          import sys
+
+          from pr_agent.config_loader import get_settings
+
+          kind, mode = IMAGE_KIND, PROBE_MODE
+          result = {"image_kind": kind, "python_version": sys.version.split()[0], "mode": mode,
+                    "result": "FAIL", "reviewer_section_loaded": False,
+                    "values": {"parallel_calls": None, "inter_call_delay_seconds": None}}
+          try:
+              if mode == "preload_copy":
+                  settings = copy.deepcopy(get_settings())
+              elif mode == "materialized_copy":
+                  settings = get_settings()
+                  settings.pr_reviewer
+                  settings = copy.deepcopy(settings)
+              else:
+                  assert mode == "direct"
+                  settings = get_settings()
+              reviewer = settings.pr_reviewer
+              result["reviewer_section_loaded"] = True
+              assert reviewer.require_tests_review is True
+              result["values"] = {key: reviewer.get(key) for key in result["values"]}
+              if kind == "overlay":
+                  assert settings.pr_reviewer.parallel_calls is True
+                  assert settings.pr_reviewer.inter_call_delay_seconds == 0
+              else:
+                  assert kind == "stock"
+                  # Exact untouched baseline contains neither fork-added scheduling field.
+                  assert "parallel_calls" not in reviewer
+                  assert "inter_call_delay_seconds" not in reviewer
+              result["result"] = "PASS"
+          except (AttributeError, AssertionError) as error:
+              result["failure_type"] = type(error).__name__
+          print(json.dumps(result))
+          '''
+          initialization = {}
+          for kind, reference in (("stock", BASE), ("overlay", TAG)):
+              initialization[kind] = {}
+              for mode in ("direct", "preload_copy", "materialized_copy"):
+                  code = "IMAGE_KIND=" + repr(kind) + "\nPROBE_MODE=" + repr(mode) + "\n" + settings_probe
+                  result = json.loads(container(reference, code))
+                  initialization[kind][mode] = result
+                  print(json.dumps(result), flush=True)
+          REPORT["settings_initialization"] = initialization
+          (EVIDENCE / "settings-initialization.json").write_text(json.dumps(initialization, indent=2) + "\n")
+          assert all(initialization[kind]["direct"]["result"] == "PASS" for kind in ("stock", "overlay")), "Packaged direct settings failed; do not work around it"
+          for mode in ("preload_copy", "materialized_copy"):
+              stock, overlay = initialization["stock"][mode], initialization["overlay"][mode]
+              assert stock["result"] == overlay["result"] and stock["reviewer_section_loaded"] == overlay["reviewer_section_loaded"], "Unexpected stock/overlay initialization difference: " + mode
+          REPORT["preload_deepcopy_failure_reproduced_on_stock"] = not initialization["stock"]["preload_copy"]["reviewer_section_loaded"]
+
           hash_code = "import hashlib,json;from pathlib import Path;print(json.dumps({p:hashlib.sha256(Path('/app',p).read_bytes()).hexdigest() for p in " + repr(RUNTIME) + "}))"
           print("GATE: runtime hashes, unchanged upstream files, entrypoint and history", flush=True)
           image_hashes = json.loads(container(TAG, hash_code))
@@ -243,7 +300,6 @@ jobs:
           cat > "$RUNNER_TEMP/qualification_smoke.py" <<'QUALIFICATION_SMOKE'
           """Offline smoke harness, mounted into (never copied into) the qualified image."""
           import asyncio
-          import copy
           import gc
           import json
           import logging
@@ -276,7 +332,8 @@ jobs:
           import pr_agent.config_security
 
           RESULTS = {"imports": "PASS", "network_isolation": "Docker --network=none plus Python socket guard"}
-          SETTINGS = copy.deepcopy(get_settings())
+          # Materialize packaged defaults directly; this disposable process needs no copy.
+          SETTINGS = get_settings()
           assert SETTINGS.pr_reviewer.parallel_calls is True
           assert SETTINGS.pr_reviewer.inter_call_delay_seconds == 0
           RESULTS["defaults"] = {"parallel_calls": True, "inter_call_delay_seconds": 0}
