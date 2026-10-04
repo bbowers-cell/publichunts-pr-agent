@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import datetime
+import math
 import re
 from functools import partial
 from typing import List, Optional, Tuple
@@ -868,6 +869,13 @@ class PRReviewer:
 
         Returns False when chunking does not apply, leaving the single-call flow in place.
         """
+        parallel_calls = get_settings().pr_reviewer.get("parallel_calls", True)
+        delay = get_settings().pr_reviewer.get("inter_call_delay_seconds", 0)
+        if not isinstance(parallel_calls, bool):
+            raise ValueError("pr_reviewer.parallel_calls must be a boolean")
+        if isinstance(delay, bool) or not isinstance(delay, (int, float)) or not math.isfinite(delay) or delay < 0:
+            raise ValueError("pr_reviewer.inter_call_delay_seconds must be a finite non-negative number")
+
         patches_diff_list = getattr(self, "_chunked_patches_diff_list", None)
         if patches_diff_list is not None:
             self._resize_pending_review_chunks(model)
@@ -903,9 +911,20 @@ class PRReviewer:
         get_logger().debug("PR diff chunks", artifact=patches_diff_list)
         chunk_results = getattr(self, "_chunked_results", {})
         pending_indices = [index for index in range(len(patches_diff_list)) if index not in chunk_results]
-        predictions = await asyncio.gather(
-            *[self._get_prediction(model, patches_diff_list[index]) for index in pending_indices],
-            return_exceptions=True)
+        if parallel_calls:
+            predictions = await asyncio.gather(
+                *[self._get_prediction(model, patches_diff_list[index]) for index in pending_indices],
+                return_exceptions=True)
+        else:
+            predictions = []
+            for position, index in enumerate(pending_indices):
+                if position and delay > 0:
+                    await asyncio.sleep(delay)
+                # A one-call gather preserves upstream child-task and exception semantics.
+                prediction, = await asyncio.gather(
+                    self._get_prediction(model, patches_diff_list[index]),
+                    return_exceptions=True)
+                predictions.append(prediction)
 
         chunk_errors = []
         for chunk_index, prediction in zip(pending_indices, predictions, strict=True):

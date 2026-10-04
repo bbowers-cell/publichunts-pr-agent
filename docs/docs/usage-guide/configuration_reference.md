@@ -184,6 +184,8 @@ to-do list.
 | `enable_review_coverage_footer` | true |  |
 | `enable_large_pr_chunking` | false | large-diff chunking (opt-in). When the token budget leaves files out of the review, split the diff into chunks, review each chunk, and merge the per-chunk results into one review. |
 | `max_number_of_calls` | 3 | maximum number of chunk review calls, used only when enable_large_pr_chunking is true |
+| `parallel_calls` | true | Preserve concurrent chunk dispatch; false awaits pending chunks in order. |
+| `inter_call_delay_seconds` | 0 | Finite non-negative delay between sequential chunk calls; ignored in parallel mode. |
 
 
 ## `[pr_description]` — /describe {#pr_description-describe}

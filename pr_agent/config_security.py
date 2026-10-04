@@ -71,9 +71,13 @@ REPO_HOST_ONLY_KEYS_BY_SECTION = {
 # GitHub Action. The runner reads it after the command has applied its arguments, so a comment
 # such as `/review --github_action_config.fail_on_tool_errors=false` could turn a failed review
 # into a green workflow; the workflow's operator sets it instead.
+# Reviewer scheduling remains configurable by the trusted root/default-branch settings or
+# host configuration. Comment/CLI arguments cannot change concurrency or occupy a worker
+# with arbitrary delays; nested settings are also blocked by the per-directory map below.
 CLI_HOST_ONLY_KEYS_BY_SECTION = {
     "config": frozenset({"repo_context_files"}),
     "github_action_config": frozenset({"fail_on_tool_errors"}),
+    "pr_reviewer": frozenset({"parallel_calls", "inter_call_delay_seconds"}),
 }
 
 # Keys a per-directory `.pr_agent.toml` can never override, even when their section is
@@ -100,6 +104,7 @@ CLI_HOST_ONLY_KEYS_BY_SECTION = {
 PER_DIRECTORY_HOST_ONLY_KEYS_BY_SECTION = {
     "pr_reviewer": frozenset({
         "enable_large_pr_chunking", "max_number_of_calls",
+        "parallel_calls", "inter_call_delay_seconds",
         "inline_key_issues", "enable_review_labels_security",
         "enable_review_labels_effort", "require_estimate_effort_to_review",
         "require_security_review", "require_ticket_analysis_review",

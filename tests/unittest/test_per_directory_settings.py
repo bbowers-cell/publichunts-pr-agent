@@ -475,6 +475,21 @@ class TestResolvePerDirectorySettings:
 
 
 class TestApplyPerDirectorySettings:
+    def test_nested_settings_cannot_override_root_review_scheduling(self, per_dir_settings, monkeypatch):
+        monkeypatch.setattr(
+            "pr_agent.git_providers.utils.get_git_provider_with_context",
+            lambda url: _provider(
+                root_settings=b"[pr_reviewer]\nparallel_calls = false\ninter_call_delay_seconds = 35\n",
+                tree_paths=["services/.pr_agent.toml"],
+                contents={"services/.pr_agent.toml":
+                          b"[pr_reviewer]\nparallel_calls = true\ninter_call_delay_seconds = 0\n"},
+                files=["services/api.py"],
+            ),
+        )
+        git_utils.apply_repo_settings("https://github.com/org/repo/pull/1")
+        assert get_settings().pr_reviewer.parallel_calls is False
+        assert get_settings().pr_reviewer.inter_call_delay_seconds == 35
+
     def test_merge_root_then_directory_nearest_wins(self, per_dir_settings, monkeypatch):
         monkeypatch.setattr(
             "pr_agent.git_providers.utils.get_git_provider_with_context",
